@@ -53,9 +53,9 @@ app.use(
     origin: [
       "http://localhost:3000",
       "http://localhost:5678/",
-      "https://app.estateai.in",
-      "https://estateai.in",
-      "https://estateai-lead.vercel.app"
+      "https://app.makemyleads.com",
+      "https://makemyleads.com",
+      "https://www.makemyleads.com",
 
     ],
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
