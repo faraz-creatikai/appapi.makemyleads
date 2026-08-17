@@ -1,5 +1,6 @@
 import { SocialContentAgent } from "../ai/agent.js";
 import cloudinary from "../config/cloudinary.js";
+import { clientUrl } from "../config/cors-origins.js";
 import prisma from "../config/prismaClient.js";
 import fs from "fs";
 
@@ -367,7 +368,7 @@ export const metaCallback = async (req, res) => {
         // =========================
         // 8. Redirect to frontend
         // =========================
-        res.redirect("http://localhost:3000/socialmedia-manager");
+        res.redirect(`${clientUrl}/socialmedia-manager`);
     } catch (err) {
         console.error("❌ OAuth Error:", err);
         res.status(500).json({
@@ -385,13 +386,13 @@ export const getInstagramLivePosts = async (req, res) => {
 
         // CHECK CACHE (5 min)
         const cached = postCache.get(cacheKey);
-        if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+       /*  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
             return res.json({
                 success: true,
                 posts: cached.data,
                 cached: true
             });
-        }
+        } */
 
         // 1. Get connected account
         const account = await prisma.socialAccount.findFirst({
@@ -824,6 +825,11 @@ export const disconnectInstagram = async (req, res) => {
             },
         });
 
+        // Clear caches
+        postCache.delete(`ig_live_posts_${userId}`);
+        postCache.delete(`ig_publish_${userId}`);
+        analyticsCache.delete(`ig_analytics_${userId}`);
+
         res.json({
             success: true,
             message: "Instagram disconnected successfully",
@@ -847,14 +853,14 @@ export const getFacebookLivePosts = async (req, res) => {
         const cacheKey = `fb_live_posts_${adminId}`;
 
         //CHECK CACHE (5 min)
-        const cached = postCache.get(cacheKey);
+        /* const cached = postCache.get(cacheKey);
         if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
             return res.json({
                 success: true,
                 posts: cached.data,
                 cached: true
             });
-        }
+        } */
 
         // 1. Get connected Facebook account
         const account = await prisma.socialAccount.findFirst({
@@ -1094,6 +1100,10 @@ export const disconnectFacebook = async (req, res) => {
             },
         });
 
+        //clear cache
+        postCache.delete(`fb_live_posts_${userId}`);
+        analyticsCache.delete(`fb_analytics_${userId}`);
+
         res.json({
             success: true,
             message: "Facebook disconnected successfully",
@@ -1124,6 +1134,36 @@ const connectInstagram = (userId) => {
 
 
 
+// ─────────────────────────────────────────────────────────────
+// Provider 1 — HuggingFace Inference API  (FREE, no usage cap)
+// Model: FLUX.1-schnell — fast, high quality, genuinely free
+// Requires HUGGINGFACE_API_KEY in .env  (free account is enough)
+// ─────────────────────────────────────────────────────────────
+const generateWithHuggingFace = async (prompt) => {
+    const res = await fetch(
+        "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell", // ← correct
+        {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
+                "Content-Type": "application/json",
+                "x-wait-for-model": "true",
+            },
+            body: JSON.stringify({
+                inputs: prompt,
+                parameters: { width: 1024, height: 1024 },
+            }),
+        }
+    );
+
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`HuggingFace ${res.status}: ${text.slice(0, 120)}`);
+    }
+
+    const arrayBuffer = await res.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+};
 
 //run auto social agent with ai generated image and caption without manual file upload
 export const runAutoSocialAgent = async (req, res) => {
@@ -1171,27 +1211,24 @@ export const runAutoSocialAgent = async (req, res) => {
         }
 
         //2. Else → fallback to AI image generation
-        else {
-            console.log("AI Post Data:", aiPost.imagePrompt);
+else {
+    const imageBuffer = await generateWithHuggingFace(aiPost.imagePrompt);
 
-            const generatedImageUrl =
-                "https://image.pollinations.ai/prompt/" +
-                encodeURIComponent(aiPost.imagePrompt) +
-                "?width=1080&height=1080&nologo=true";
+    const folder = platform === "FACEBOOK"
+        ? "facebook/facebook_images"
+        : "instagram/instagram_images";
 
-            console.log("Generated Image URL:", generatedImageUrl);
-
-            const upload = await cloudinary.uploader.upload(generatedImageUrl, {
-                folder:
-                    platform === "FACEBOOK"
-                        ? "facebook/facebook_images"
-                        : "instagram/instagram_images",
-                transformation: [{ width: 1000, crop: "limit" }],
-                timeout: 120000,
-            });
-
-            imageUrl = upload.secure_url;
-        }
+    // upload_stream because we have a Buffer, not a file path or URL
+    imageUrl = await new Promise((resolve, reject) => {
+        cloudinary.uploader.upload_stream(
+            { folder, transformation: [{ width: 1000, crop: "limit" }] },
+            (error, result) => {
+                if (error) return reject(error);
+                resolve(result.secure_url);
+            }
+        ).end(imageBuffer); // .end() pushes the Buffer into the stream
+    });
+}
 
 
 

@@ -54,7 +54,9 @@ const getPublicIdFromUrl = (url) => {
 // ------------------------------------------------------
 //      Attach AssignTo information (only basic)
 // ------------------------------------------------------
-const transformGetCustomer = async (c) => {
+const transformGetCustomer = async (c, admin = null) => {
+  const adminId = admin?.id || admin?._id;
+
   const base = {
     ...c,
     _id: c.id,
@@ -63,44 +65,39 @@ const transformGetCustomer = async (c) => {
     SitePlan: parseJSON(c.SitePlan),
   };
 
-  // FIX: Prisma column is AssignToId, not AssignTo
-  const assignToDoc = c.AssignToId
-    ? await prisma.admin.findUnique({
-      where: { id: c.AssignToId },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        role: true,
-        city: true,
-      },
-    })
-    : null;
+  // Hide contact number only for user/agent viewing assigned customers
+  if (
+    admin &&
+    (admin.role === "agent" || admin.role === "user") &&
+    base.CreatedById !== adminId
+  ) {
+    base.ContactNumber = "forbidden"; // or "XXXXXXXXXX"
+  }
 
-  return {
-    ...base,
-    /* AssignTo: assignToDoc
-      ? {
-        _id: assignToDoc.id,
-        name: assignToDoc.name,
-        email: assignToDoc.email,
-        role: assignToDoc.role,
-        city: assignToDoc.city,
-      }
-      : null, */
-  };
+  return base;
 };
 
 // ------------------------------------------------------
 //      Transform single customer (getCustomerById)
 // ------------------------------------------------------
-const transformCustomer = async (c) => {
+const transformCustomer = async (c, admin = null) => {
+  const adminId = admin?.id || admin?._id;
+
   const base = {
     ...c,
     _id: c.id,
     CustomerImage: parseJSON(c.CustomerImage),
     SitePlan: parseJSON(c.SitePlan),
   };
+
+  // Hide contact number for assigned customers (not self-created)
+  if (
+    admin &&
+    (admin.role === "agent" || admin.role === "user") &&
+    base.CreatedById !== adminId
+  ) {
+    base.ContactNumber = "forbidden"; // or "XXXXXXXXXX"
+  }
 
   const [
     campaignDoc,
@@ -138,15 +135,15 @@ const transformCustomer = async (c) => {
     }),
     c.AssignToId
       ? prisma.admin.findUnique({
-        where: { id: c.AssignToId },
-        select: { id: true, name: true, email: true, role: true, city: true },
-      })
+          where: { id: c.AssignToId },
+          select: { id: true, name: true, email: true, role: true, city: true },
+        })
       : null,
     c.CreatedBy
       ? prisma.admin.findUnique({
-        where: { id: c.CreatedBy },
-        select: { id: true, name: true, email: true },
-      })
+          where: { id: c.CreatedBy },
+          select: { id: true, name: true, email: true },
+        })
       : null,
   ]);
 
@@ -171,26 +168,27 @@ const transformCustomer = async (c) => {
     Location: locationDoc
       ? { _id: locationDoc.id, Name: locationDoc.Name }
       : { _id: null, Name: c.Location || "" },
+
     SubLocation: subLocationDoc
       ? { _id: subLocationDoc.id, Name: subLocationDoc.Name }
       : { _id: null, Name: c.SubLocation || "" },
 
     AssignTo: assignToDoc
       ? {
-        _id: assignToDoc.id,
-        name: assignToDoc.name,
-        email: assignToDoc.email,
-        role: assignToDoc.role,
-        city: assignToDoc.city,
-      }
+          _id: assignToDoc.id,
+          name: assignToDoc.name,
+          email: assignToDoc.email,
+          role: assignToDoc.role,
+          city: assignToDoc.city,
+        }
       : null,
 
     CreatedBy: createdByDoc
       ? {
-        _id: createdByDoc.id,
-        name: createdByDoc.name,
-        email: createdByDoc.email,
-      }
+          _id: createdByDoc.id,
+          name: createdByDoc.name,
+          email: createdByDoc.email,
+        }
       : null,
   };
 };
@@ -209,6 +207,73 @@ const toBoolean = (val) => {
   return undefined; // if invalid or empty string
 };
 
+
+export const getCustomerAccessFilter = async (admin) => {
+  if (!admin) return { id: "__none__" }; // fail closed
+
+  const adminId = admin.id || admin._id;
+  const AND = [];
+
+  // Original Condition #1
+  if (admin.role !== "administrator" && admin.clientId) {
+    AND.push({
+      OR: [
+        { ClientId: admin.clientId },
+        { CreatedById: adminId },
+      ],
+    });
+  }
+
+  // Original Condition #2
+  if (admin.role === "user" || admin.role === "agent") {
+    AND.push({
+      OR: [
+        { AssignTo: { some: { id: adminId } } },
+        { CreatedById: adminId },
+      ],
+    });
+  }
+  // Original Condition #3
+  else if (admin.role === "city_admin") {
+    const assignedCampaignsData = await prisma.customer.findMany({
+      where: {
+        AssignTo: {
+          some: { id: adminId },
+        },
+      },
+      select: {
+        Campaign: true,
+      },
+      distinct: ["Campaign"],
+    });
+
+    const assignedCampaigns = assignedCampaignsData
+      .map((c) => c.Campaign)
+      .filter(Boolean);
+
+    AND.push({
+      City: {
+        equals: admin.city,
+      },
+    });
+
+    AND.push({
+      OR: [
+        { CreatedById: adminId },
+        { AssignTo: { some: { id: adminId } } },
+        ...(assignedCampaigns.length > 0
+          ? [{ Campaign: { in: assignedCampaigns } }]
+          : []),
+      ],
+    });
+  }
+
+  if (AND.length === 0) {
+    return {};
+  }
+
+  return { AND };
+};
 
 // --------------------------------------------
 // REMOVE DUPLICATES BY CONTACTNUMBER, KEEP LAST UPDATED
@@ -241,299 +306,857 @@ function deduplicateByContact(customers) {
 // ======================================================
 
 
+// 1. Create a simple global cache store right at the top of your file
+const customerCache = new Map();
+const CACHE_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+export const getAllCustomers = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    const adminId = admin.id || admin._id;
+
+    // ---------------------------------------------------------
+    // 2. CHECK LOCAL CACHE
+    // ---------------------------------------------------------
+    const cacheKey = `customers:${adminId}:${admin.role}`;
+    const cachedItem = customerCache.get(cacheKey);
+
+    // If cache exists and hasn't expired (under 5 minutes old), return it instantly!
+    if (cachedItem && (Date.now() - cachedItem.timestamp < CACHE_TIMEOUT)) {
+      return res.status(200).json(cachedItem.data);
+    }
+
+    // ---------------------------------------------------------
+    // 3. ISOLATED ROLE-BASED LOGIC
+    // ---------------------------------------------------------
+    let AND = [];
+
+    const accessFilter = await getCustomerAccessFilter(admin);
+    if (Object.keys(accessFilter).length > 0) {
+      AND.push(accessFilter);
+    }
+
+
+    const where = AND.length ? { AND } : {};
+
+    // ---------------------------------------------------------
+    // 4. FAST DATABASE FETCH & TRANSFORM
+    // ---------------------------------------------------------
+    const customers = await prisma.customer.findMany({
+      where,
+      orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
+      include: { AssignTo: true },
+    });
+
+    const transformed = await Promise.all(customers.map(transformGetCustomer,admin));
+
+    // ---------------------------------------------------------
+    // 5. SAVE TO CACHE FOR NEXT TIME
+    // ---------------------------------------------------------
+    customerCache.set(cacheKey, {
+      data: transformed,
+      timestamp: Date.now()
+    });
+
+    return res.status(200).json(transformed);
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
 // ------------------------------------------------------
 //               GET TODAY CUSTOMERS
 // ------------------------------------------------------
+
 export const getTodayCustomers = async (req, res, next) => {
   try {
     const admin = req.admin;
+    const adminId = admin.id || admin._id;
 
-    let AND = [];
+    // TODAY RANGE
+    const start = dayjs().tz("Asia/Kolkata").startOf("day").utc().toDate();
+    const end = dayjs().tz("Asia/Kolkata").endOf("day").utc().toDate();
 
-    // 🕒 TODAY RANGE
-    const start = dayjs()
-      .tz("Asia/Kolkata")
-      .startOf("day")
-      .utc()
-      .toDate();
-
-    const end = dayjs()
-      .tz("Asia/Kolkata")
-      .endOf("day")
-      .utc()
-      .toDate();
-
-    // --------------------------------------------
-    // ROLE-BASED FILTERS (SAME AS YOUR API)
-    // --------------------------------------------
-
-    if (admin.role !== "administrator" && admin.clientId) {
-      AND.push({
-        OR: [
-          { ClientId: admin.clientId },
-          { CreatedById: admin.id || admin._id }
-        ]
-      });
-    }
-
-    if (admin.role === "user") {
-      const adminId = admin.id || admin._id;
-
-      AND.push({
-        OR: [
-          {
-            AssignTo: {
-              some: { id: adminId }
-            }
-          },
-          {
-            CreatedById: adminId
-          }
-        ]
-      });
-    }
-
-    else if (admin.role === "city_admin") {
-      const adminId = admin.id || admin._id;
-
-      // 🔹 get assigned campaigns
-      const assignedCampaignsData = await prisma.customer.findMany({
-        where: {
-          AssignTo: {
-            some: { id: adminId }
-          }
+    //  OPTIMIZATION 1: Put the date filter first. 
+    // This forces the SQL query planner to immediately shrink the search pool 
+    // to ONLY today's records BEFORE calculating complex Role-Based rules.
+    let AND = [
+      {
+        createdAt: {
+          gte: start,
+          lte: end,
         },
-        select: { Campaign: true },
-        distinct: ["Campaign"]
-      });
+      },
+    ];
 
-      const assignedCampaigns = assignedCampaignsData
-        .map(c => c.Campaign)
-        .filter(Boolean);
+    // --------------------------------------------
+    // ROLE-BASED FILTERS
+    // --------------------------------------------
+    const accessFilter = await getCustomerAccessFilter(admin);
 
-      AND.push({
-        OR: [
-          {
-            CreatedById: adminId
-          },
-          {
-            AND: [
-              {
-                AssignTo: {
-                  some: { id: adminId }
-                }
-              },
-              {
-                City: {
-                  contains: admin.city
-                }
-              }
-            ]
-          },
-          ...(assignedCampaigns.length > 0
-            ? [{
-              AND: [
-                {
-                  Campaign: { in: assignedCampaigns }
-                },
-                {
-                  City: {
-                    contains: admin.city
-                  }
-                }
-              ]
-            }]
-            : [])
-        ]
-      });
+    if (Object.keys(accessFilter).length > 0) {
+      AND.push(accessFilter);
     }
 
     // --------------------------------------------
-    // TODAY FILTER
+    // EXECUTE FETCH
     // --------------------------------------------
-    AND.push({
-      createdAt: {
-        gte: start,
-        lte: end
-      }
-    });
-
     const customers = await prisma.customer.findMany({
       where: { AND },
-      orderBy: {
-        createdAt: "desc"
-      },
-      include: {
-        AssignTo: true
-      }
+      orderBy: { createdAt: "desc" },
+      //distinct: ["ContactNumber"], // 🚀 Enforcing your unique leads rule
+
     });
+
+    // 🚀 OPTIMIZATION 3: Concurrent Transformation
+    // Forces the loop to process all records simultaneously instead of waiting sequentially.
     const transformedCustomers = await Promise.all(
-      customers.map(c => transformGetCustomer(c))
+      customers.map((c) => transformGetCustomer(c,admin))
     );
 
-    res.status(200).json(transformedCustomers);
-
-
+    return res.status(200).json(transformedCustomers);
   } catch (error) {
-    next(error);
+    next(error); // Passes the error to your global ApiError handler
   }
 };
 
 // ------------------------------------------------------
 //               GET CUSTOMERS
 // ------------------------------------------------------
+
+// Lightweight in-memory cache for dashboard stats
+const dashboardCache = {
+  data: null,
+  expiry: 0,
+};
+
+// Lightweight in-memory cache for lead sources
+const leadSourceCache = {
+  data: null,
+  expiry: 0,
+};
+
+// Lightweight in-memory cache for lead temperatures
+const tempCache = {
+  data: null,
+  expiry: 0,
+};
+
+// Lightweight in-memory cache for Visitors Chart
+const visitorsChartCache = {
+  data: null,
+  expiry: 0,
+};
+
+// Lightweight in-memory cache for Followup Chart
+const followupChartCache = {
+  data: null,
+  expiry: 0,
+};
+
+// Lightweight in-memory cache for location stats
+const locationStatsCache = {
+  data: null,
+  expiry: 0,
+};
+
+// Lightweight in-memory cache for Agent Assignments
+const radarChartCache = {
+  data: null,
+  expiry: 0,
+};
+
+// Set cache duration (e.g., 5 minutes)
+const CACHE_TTL_MS = 0.1 * 60 * 1000;
+
+
+
+
+export const getDashboardStatsCount = async (req, res, next) => {
+  try {
+
+    const admin = req.admin;
+
+    const accessFilter = await getCustomerAccessFilter(admin);
+    const where = Object.keys(accessFilter).length
+      ? { AND: [accessFilter] }
+      : {};
+    const now = Date.now();
+
+    // 1. Serve from cache if valid
+    if (dashboardCache.data !== null && dashboardCache.expiry > now) {
+      return res.status(200).json({
+        success: true,
+        data: dashboardCache.data,
+        source: "cache"
+      });
+    }
+
+    // 2. Fetch all required data concurrently
+    const [
+      uniqueCustomers,
+      totalContacts,
+      uniqueFollowups,
+      incomeRecords
+    ] = await Promise.all([
+      // 1. Leads: Unique customers by ContactNumber
+      prisma.customer.findMany({
+        where,
+        distinct: ["ContactNumber"],
+        select: { id: true },
+      }),
+
+      // 2. Contacts: Native DB counting
+      prisma.contact.count(),
+
+      // 3. Converted Leads: Unique customers in the Followup table
+      prisma.followup.findMany({
+        distinct: ["customerId"],
+        select: { id: true }
+      }),
+
+      // 4. Income: Fetching only the Income field to sum it up
+      // Note: If 'Income' is saved as an Int/Float in your schema, 
+      // you could use prisma.income.aggregate({ _sum: { Income: true } }) here instead.
+      prisma.income.findMany({
+        select: { Name: true } // Assuming the field is named 'Income'
+      })
+    ]);
+
+    // Safely calculate the total revenue on the server
+    const totalRevenue = incomeRecords.reduce(
+      (sum, item) => sum + (Number(item.Name) || 0),
+      0
+    );
+
+    const stats = {
+      totalCustomers: uniqueCustomers.length,
+      convertedLeads: uniqueFollowups.length,
+      totalContacts: totalContacts,
+      totalIncome: totalRevenue
+    };
+
+    // 3. Update the cache
+    dashboardCache.data = stats;
+    dashboardCache.expiry = now + CACHE_TTL_MS;
+
+    // 4. Return fresh response
+    return res.status(200).json({
+      success: true,
+      data: stats,
+      source: "database"
+    });
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+
+export const getLeadSourcesStats = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+
+    const accessFilter = await getCustomerAccessFilter(admin);
+    const where = Object.keys(accessFilter).length
+      ? { AND: [accessFilter] }
+      : {};
+
+    const now = Date.now();
+
+    if (leadSourceCache.data !== null && leadSourceCache.expiry > now) {
+      return res.status(200).json({
+        success: true,
+        data: leadSourceCache.data,
+        source: "cache",
+      });
+    }
+
+    // 🚀 FIX: Removed the "where" clause so we fetch ALL unique leads
+    const uniqueCustomers = await prisma.customer.findMany({
+      where,
+      // distinct: ["ContactNumber"],
+      select: { ReferenceId: true },
+    });
+
+    const counts = {};
+
+    uniqueCustomers.forEach((item) => {
+      // Only count it if it actually exists
+      if (item.ReferenceId) {
+        const ref = item.ReferenceId.toLowerCase().trim();
+        counts[ref] = (counts[ref] || 0) + 1;
+      }
+    });
+
+    // Package the counts AND the true total
+    const responseData = {
+      counts,
+      total: uniqueCustomers.length // True 1:1 match with main dashboard
+    };
+
+    leadSourceCache.data = responseData;
+    leadSourceCache.expiry = now + CACHE_TTL_MS;
+
+    return res.status(200).json({
+      success: true,
+      data: responseData,
+      source: "database",
+    });
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+
+export const getLeadTemperatureStats = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+
+    const accessFilter = await getCustomerAccessFilter(admin);
+
+    const where = {
+      AND: [
+        accessFilter,
+        {
+          LeadTemperature: {
+            not: null,
+            not: ""
+          }
+        }
+      ]
+    };
+    const now = Date.now();
+
+    // 1. Serve from cache if valid
+    if (tempCache.data !== null && tempCache.expiry > now) {
+      return res.status(200).json({
+        success: true,
+        data: tempCache.data,
+        source: "cache",
+      });
+    }
+
+    // 2. Fetch UNIQUE customers by ContactNumber, selecting ONLY the LeadTemperature
+    const uniqueCustomers = await prisma.customer.findMany({
+      where,
+      //distinct: ["ContactNumber"], // 🚀 Filters duplicates natively
+      select: {
+        LeadTemperature: true
+      },
+    });
+
+    // 3. Initialize clean buckets
+    const counts = { hot: 0, warm: 0, cold: 0 };
+
+    // 4. Tally up the unique results
+    uniqueCustomers.forEach((item) => {
+      // Clean string (e.g., " Hot ", "HOT" -> "hot")
+      const tempString = item.LeadTemperature.toLowerCase().trim();
+
+      // Only count if it's a valid key ('hot', 'warm', or 'cold')
+      if (tempString in counts) {
+        counts[tempString] += 1;
+      }
+    });
+
+    // 5. Update the cache
+    tempCache.data = counts;
+    tempCache.expiry = now + CACHE_TTL_MS;
+
+    // 6. Send response
+    return res.status(200).json({
+      success: true,
+      data: counts,
+      source: "database",
+    });
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+
+export const getVisitorsChartStats = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+
+    const accessFilter = await getCustomerAccessFilter(admin);
+    const where = Object.keys(accessFilter).length
+      ? { AND: [accessFilter] }
+      : {};
+
+    const now = new Date();
+
+    // 1. Serve from cache if valid
+    if (visitorsChartCache.data !== null && visitorsChartCache.expiry > now.getTime()) {
+      return res.status(200).json({
+        success: true,
+        data: visitorsChartCache.data,
+        source: "cache",
+      });
+    }
+
+    // 2. Fetch UNIQUE customers by ContactNumber, selecting ONLY createdAt
+    const uniqueCustomers = await prisma.customer.findMany({
+      where,
+      distinct: ["ContactNumber"],
+      select: { createdAt: true },
+    });
+
+    // 3. Time boundaries
+    const currentMonth = now.getMonth();
+    const currentYear = now.getFullYear();
+    const firstDayCurrentMonth = new Date(currentYear, currentMonth, 1);
+    const firstDayLastMonth = new Date(currentYear, currentMonth - 1, 1);
+    const lastDayLastMonth = new Date(currentYear, currentMonth, 0, 23, 59, 59, 999);
+
+    let oldVisitorCount = 0;
+    let lastMonthCount = 0;
+    const newCustomers = []; // Keep dates for new customers to calculate cumulative growth
+    const groupedByMonth = {};
+
+    // 4. Process all dates in one single O(n) loop
+    uniqueCustomers.forEach((c) => {
+      const d = new Date(c.createdAt);
+      const m = d.getMonth();
+      const y = d.getFullYear();
+
+      // Group for average calculation
+      const key = `${y}-${m}`;
+      groupedByMonth[key] = (groupedByMonth[key] || 0) + 1;
+
+      // Old Customers (Created before this month)
+      if (d < firstDayCurrentMonth) {
+        oldVisitorCount++;
+      }
+
+      // Last Month Customers
+      if (d >= firstDayLastMonth && d <= lastDayLastMonth) {
+        lastMonthCount++;
+      }
+
+      // New Customers (Created this month)
+      if (m === currentMonth && y === currentYear) {
+        newCustomers.push(d);
+      }
+    });
+
+    // Calculate Average
+    const numMonths = Object.keys(groupedByMonth).length;
+    const totalAll = uniqueCustomers.length;
+    const avgPerMonth = numMonths > 0 ? totalAll / numMonths : 0;
+
+    // 5. Generate Chart Timeline (6 intervals up to today)
+    const today = now.getDate();
+    const step = Math.ceil(today / 6);
+    const chartData = [];
+
+    for (let day = 1; day <= today; day += step) {
+      const fullDate = new Date(currentYear, currentMonth, day);
+      const formattedDate = fullDate.toLocaleString("en-US", { month: "short", day: "numeric" });
+
+      // Count new customers created on or before this tick
+      const newVisitorCount = newCustomers.filter((d) => d.getDate() <= day).length;
+
+      chartData.push({
+        date: formattedDate,
+        newVisitor: newVisitorCount,
+        oldVisitor: oldVisitorCount,
+        lastMonth: lastMonthCount,
+        avg: Math.round(avgPerMonth),
+      });
+    }
+
+    // Ensure today's actual date is always the final tick
+    const lastFormattedDate = new Date(currentYear, currentMonth, today).toLocaleString("en-US", { month: "short", day: "numeric" });
+    if (!chartData.find((r) => r.date === lastFormattedDate)) {
+      chartData.push({
+        date: lastFormattedDate,
+        newVisitor: newCustomers.length,
+        oldVisitor: oldVisitorCount,
+        lastMonth: lastMonthCount,
+        avg: Math.round(avgPerMonth),
+      });
+    }
+
+    // 6. Save to cache
+    visitorsChartCache.data = chartData;
+    visitorsChartCache.expiry = now.getTime() + CACHE_TTL_MS;
+
+    return res.status(200).json({
+      success: true,
+      data: chartData,
+      source: "database",
+    });
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+export const getFollowupChartStats = async (req, res, next) => {
+  try {
+    const now = new Date();
+
+    // 1. Serve from cache if valid
+    if (followupChartCache.data !== null && followupChartCache.expiry > now.getTime()) {
+      return res.status(200).json({
+        success: true,
+        data: followupChartCache.data,
+        source: "cache",
+      });
+    }
+
+    // 2. Fetch ONLY the necessary date strings
+    const allFollowups = await prisma.followup.findMany({
+      select: {
+        StartDate: true,
+        FollowupNextDate: true
+      },
+    });
+
+    // 3. Setup the 4-month buckets
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth();
+
+    const months = Array.from({ length: 4 }).map((_, index) => {
+      const d = new Date(currentYear, currentMonth + index, 1);
+      return {
+        month: d.getMonth(),
+        year: d.getFullYear(),
+        label: d.toLocaleString("en-US", { month: "short" }),
+        count: 0,
+      };
+    });
+
+    // Helper to parse DD-MM-YYYY
+    const parseDDMMYYYY = (dateStr) => {
+      const [day, month, year] = dateStr.split("-");
+      return new Date(Number(year), Number(month) - 1, Number(day));
+    };
+
+    // 4. Process all dates in memory (O(n) speed)
+    allFollowups.forEach((item) => {
+      if (!item.StartDate && !item.FollowupNextDate) return;
+
+      const startDate = item.StartDate ? new Date(item.StartDate) : null;
+      const followupDate = item.FollowupNextDate ? parseDDMMYYYY(item.FollowupNextDate) : null;
+
+      // Prefer FollowupNextDate over StartDate
+      const checkDate = followupDate || startDate;
+
+      // Skip if date parsing failed
+      if (!checkDate || isNaN(checkDate.getTime())) return;
+
+      // Drop into the correct bucket if it matches
+      for (const m of months) {
+        if (checkDate.getMonth() === m.month && checkDate.getFullYear() === m.year) {
+          m.count += 1;
+          break; // Stop checking once we find a match
+        }
+      }
+    });
+
+    // 5. Format exactly how Recharts expects it
+    const formattedChart = months.map((m) => ({
+      name: m.label,
+      followups: m.count,
+    }));
+
+    // 6. Update the cache
+    followupChartCache.data = formattedChart;
+    followupChartCache.expiry = now.getTime() + CACHE_TTL_MS;
+
+    // 7. Send response
+    return res.status(200).json({
+      success: true,
+      data: formattedChart,
+      source: "database",
+    });
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+export const getCustomerLocationStats = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+
+    const accessFilter = await getCustomerAccessFilter(admin);
+
+    const where = {
+      AND: [
+        accessFilter,
+        {
+          Location: {
+            not: null,
+            not: ""
+          }
+        }
+      ]
+    };
+    const now = Date.now();
+
+    // 1. Serve from cache if valid
+    if (locationStatsCache.data !== null && locationStatsCache.expiry > now) {
+      return res.status(200).json({
+        success: true,
+        data: locationStatsCache.data,
+        source: "cache",
+      });
+    }
+
+    // 2. Fetch UNIQUE customers by ContactNumber, selecting ONLY the Location
+    const uniqueCustomers = await prisma.customer.findMany({
+      where,
+      distinct: ["ContactNumber"], // Filters duplicates natively
+      select: {
+        Location: true
+      },
+    });
+
+    // 3. Tally up the unique results in memory
+    const locationMap = {};
+    uniqueCustomers.forEach((item) => {
+      // Normalize casing if needed, or leave as-is to preserve DB casing
+      const loc = item.Location.trim();
+      locationMap[loc] = (locationMap[loc] || 0) + 1;
+    });
+
+    // 4. Convert to sorted array [{ location: "New York", customers: 12 }, ...]
+    const locationArray = Object.entries(locationMap)
+      .map(([location, count]) => ({
+        location,
+        customers: count,
+      }))
+      .sort((a, b) => b.customers - a.customers);
+
+    // 5. Update the cache
+    locationStatsCache.data = locationArray;
+    locationStatsCache.expiry = now + CACHE_TTL_MS;
+
+    // 6. Send response
+    return res.status(200).json({
+      success: true,
+      data: locationArray,
+      source: "database",
+    });
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+
+export const getRadarChartStats = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+
+    const accessFilter = await getCustomerAccessFilter(admin);
+    const where = Object.keys(accessFilter).length
+      ? { AND: [accessFilter] }
+      : {};
+    const now = Date.now();
+
+    // 1. Serve from cache if valid
+    if (radarChartCache.data !== null && radarChartCache.expiry > now) {
+      return res.status(200).json({
+        success: true,
+        data: radarChartCache.data,
+        source: "cache",
+      });
+    }
+
+    // 2. Fetch UNIQUE customers by ContactNumber, selecting ONLY the AssignTo relation
+    const uniqueCustomers = await prisma.customer.findMany({
+      where,
+      distinct: ["ContactNumber"], // Keep your unique leads logic intact
+      select: {
+        AssignTo: {
+          select: { id: true, name: true }, // Only pull what we need to count
+        },
+      },
+    });
+
+    const totalCustomers = uniqueCustomers.length;
+    const userMap = {};
+
+    // 3. Tally up the assignments in memory (O(n) speed)
+    uniqueCustomers.forEach((customer) => {
+      // Skip if the customer has no assigned agents
+      if (!customer.AssignTo || customer.AssignTo.length === 0) return;
+
+      customer.AssignTo.forEach((user) => {
+        if (!userMap[user.id]) {
+          userMap[user.id] = { id: user.id, name: user.name, customers: 0 };
+        }
+        userMap[user.id].customers += 1;
+      });
+    });
+
+    // 4. Format into an array, calculate percentages, and sort by highest load
+    const result = Object.values(userMap)
+      .map((user) => ({
+        ...user,
+        percentage: totalCustomers > 0
+          ? Math.round((user.customers / totalCustomers) * 100)
+          : 0,
+      }))
+      .sort((a, b) => b.customers - a.customers);
+
+    // 5. Update the cache
+    radarChartCache.data = result;
+    radarChartCache.expiry = now + CACHE_TTL_MS;
+
+    // 6. Send response
+    return res.status(200).json({
+      success: true,
+      data: result,
+      source: "database",
+    });
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+export const getCustomerCount = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    let AND = [];
+
+    // --------------------------------------------
+    // 1. ROLE-BASED FILTERS
+    // --------------------------------------------
+    const accessFilter = await getCustomerAccessFilter(admin);
+
+    if (Object.keys(accessFilter).length > 0) {
+      AND.push(accessFilter);
+    }
+
+    // --------------------------------------------
+    // 2. BASIC FILTERS
+    // --------------------------------------------
+    AND.push({ DealClosed: false });
+
+    // (Add any of your other dynamic Keyword, Date, or Price filters here)
+
+    const where = AND.length ? { AND } : {};
+
+    // --------------------------------------------
+    // 3. EXECUTE OPTIMIZED COUNT
+    // --------------------------------------------
+    const uniqueCustomers = await prisma.customer.findMany({
+      where,
+      distinct: ["ContactNumber"],
+      // 🚀 OPTIMIZATION 2: The Index-Only Scan Trick
+      // By selecting the exact field used in 'distinct', the DB resolves this 
+      // instantly from memory without reading the actual row data.
+      select: { ContactNumber: true },
+    });
+
+    return res.status(200).json({
+      success: true,
+      totalCount: uniqueCustomers.length // Lightning fast length calculation
+    });
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+//new scaled get controller with better performance
 export const getCustomer = async (req, res, next) => {
   try {
     const admin = req.admin;
 
     const {
-      Campaign,
-      CustomerType,
-      CustomerSubType,
-      LeadTemperature,
-      StatusType,
-      City,
-      Location,
-      SubLocation,
-      LeadType,
-      Keyword,
-      SearchIn,
-      ReferenceId,
-      MinPrice,
-      MaxPrice,
-      Price,
-      isFavourite,
-      StartDate,
-      EndDate,
-      Limit,
-      Skip = 0,
-      sort,
-      User,
-      ContactNumber
+      Campaign, CustomerType, CustomerSubType, LeadTemperature, StatusType,
+      City, Location, SubLocation, LeadType, Keyword, SearchIn, ReferenceId,
+      MinPrice, MaxPrice, Price, isFavourite, StartDate, EndDate, Limit,
+      Skip = 0, sort, User, ContactNumber, CustomerFields,
     } = req.query;
 
     let AND = [];
     const REQUIRED = Limit !== undefined ? Number(Limit) : 100;
-    const FETCH_MULTIPLIER = 3; // safe over-fetch
-
     const offset = Number(Skip);
 
     // --------------------------------------------
-    // ROLE-BASED FILTERS
+    // 1. ROLE-BASED FILTERS (Database Level)
     // --------------------------------------------
+    const accessFilter = await getCustomerAccessFilter(admin);
 
-
-
-    if (admin.role !== "administrator" && admin.clientId) {
-      AND.push({
-        OR: [
-          { ClientId: admin.clientId },
-          { CreatedById: admin.id || admin._id }
-        ]
-      });
-    }
-
-
-    // --------------------------------------------
-    // USER → ONLY DIRECT ASSIGNMENT (STRICT)
-    // --------------------------------------------
-    if (admin.role === "user") {
-      const adminId = admin.id || admin._id;
-
-      AND.push({
-        OR: [
-          {
-            AssignTo: {
-              some: { id: adminId }
-            }
-          },
-          {
-            CreatedById: adminId
-          }
-        ]
-      });
-    }
-    else if (admin.role === "city_admin") {
-      const adminId = admin.id || admin._id;
-
-      // Step 1: get campaigns
-      const assignedCampaignsData = await prisma.customer.findMany({
-        where: {
-          AssignTo: {
-            some: { id: adminId }
-          }
-        },
-        select: { Campaign: true },
-        distinct: ["Campaign"]
-      });
-
-      const assignedCampaigns = assignedCampaignsData
-        .map(c => c.Campaign)
-        .filter(Boolean);
-
-      // STEP 2: GLOBAL CITY FILTER (VERY IMPORTANT)
-      AND.push({
-        City: {
-          equals: admin.city
-        }
-      });
-
-      // STEP 3: ACCESS LOGIC (non-restrictive now)
-      AND.push({
-        OR: [
-          { CreatedById: adminId },
-
-          {
-            AssignTo: {
-              some: { id: adminId }
-            }
-          },
-
-          ...(assignedCampaigns.length > 0
-            ? [{
-              Campaign: { in: assignedCampaigns }
-            }]
-            : []),
-
-          // THIS LINE FIXES YOUR CORE ISSUE
-          // allow other city data even if not assigned/campaign
-          {}
-        ]
-      });
+    if (Object.keys(accessFilter).length > 0) {
+      AND.push(accessFilter);
     }
 
     // --------------------------------------------
-    // BASIC FILTERS
+    // 2. BASIC FILTERS (Database Level)
     // --------------------------------------------
+    AND.push({ DealClosed: false });
+
+    const adminId = admin.id || admin._id;
+    AND.push({ archivedBy: { none: { adminId } } });
+
     if (Campaign) AND.push({ Campaign: { contains: Campaign.trim() } });
-
-    if (CustomerType)
-      AND.push({ CustomerType: { contains: CustomerType.trim() } });
-
+    if (CustomerType) AND.push({ CustomerType: { contains: CustomerType.trim() } });
     if (CustomerSubType) AND.push({ CustomerSubType: { contains: CustomerSubType.trim() } });
-
     if (StatusType) AND.push({ Verified: { contains: StatusType.trim() } });
-
     if (LeadTemperature) AND.push({ LeadTemperature: { contains: LeadTemperature.trim() } });
     if (LeadType) AND.push({ LeadType: { contains: LeadType.trim() } });
-
     if (City) AND.push({ City: { contains: City.trim() } });
-
     if (Location) AND.push({ Location: { contains: Location.trim() } });
     if (SubLocation) AND.push({ SubLocation: { contains: SubLocation.trim() } });
     if (ContactNumber) AND.push({ ContactNumber: { contains: ContactNumber.trim() } });
     if (ReferenceId) AND.push({ ReferenceId: { contains: ReferenceId.trim() } });
     if (Price) AND.push({ Price: { contains: Price.trim() } });
+
     // --------------------------------------------
-    // PRICE RANGE FILTER (MIN / MAX)
+    // 2B. CUSTOM FIELD FILTERS (dynamic JSON)
     // --------------------------------------------
-    const cleanNumber = (val) =>
-      Number(String(val || "").replace(/[^0-9]/g, ""));
+    if (CustomerFields) {
+      try {
+        // Express automatically decodes the URL into a string.
+        // This will successfully turn '{"State":"Gujarat"}' into a real object.
+        const customFieldFilters = JSON.parse(CustomerFields);
+
+        // Add this line to see the proof in your server console!
+        console.log("✅ Parsed CustomerFields from Frontend:", customFieldFilters);
+
+        Object.entries(customFieldFilters).forEach(([key, value]) => {
+          const trimmed = String(value ?? "").trim();
+          if (!trimmed) return;
+
+          AND.push({
+            CustomerFields: {
+              // 1. Use standard SQL JSON dot-notation for the path
+              path: `$.${key}`,
+
+              // 2. Use 'equals' instead of 'string_contains'
+              // string_contains inside JSON columns often fails in MySQL because 
+              // the DB stores JSON string values wrapped in internal quotes. 
+              // Prisma's 'equals' handles this natively.
+              equals: trimmed,
+            },
+          });
+        });
+      } catch (err) {
+        console.error("❌ JSON Parse Error:", err);
+      }
+    }
+
+    const cleanNumber = (val) => Number(String(val || "").replace(/[^0-9]/g, ""));
 
     if (MinPrice || MaxPrice) {
       const min = MinPrice ? cleanNumber(MinPrice) : null;
       const max = MaxPrice ? cleanNumber(MaxPrice) : null;
-
       AND.push({
         PriceNumber: {
           ...(min !== null && !isNaN(min) && { gte: min }),
@@ -541,42 +1164,63 @@ export const getCustomer = async (req, res, next) => {
         }
       });
     }
+
     if (typeof isFavourite !== "undefined") {
+      AND.push({ isFavourite: isFavourite === "true" });
+    }
+
+    // --------------------------------------------
+    // 3. FIX: ADVANCED FILTERS BROUGHT TO DB LEVEL
+    // --------------------------------------------
+
+    // Fix A: Move User filtering directly into Prisma query where clause
+    if (User) {
+      const userLower = User.toLowerCase();
+      const matchingAdmins = await prisma.admin.findMany({
+        where: {
+          OR: [
+            { name: { contains: User } },
+            { email: { contains: User } },
+            { city: { contains: User } },
+            ["admin", "city_admin", "user"].includes(userLower) ? { role: { equals: User } } : undefined,
+          ].filter(Boolean),
+        },
+        select: { id: true },
+      });
+      const allowedAdminIds = matchingAdmins.map((a) => a.id);
+      AND.push({ AssignTo: { some: { id: { in: allowedAdminIds } } } });
+    }
+
+    // Fix B: Move Date Range parameters directly into the DB structure
+    if (StartDate && EndDate) {
+      // Assumes standard ISO/YYYY-MM-DD format handling at DB level. 
+      // If CustomerDate is a string field, ensure your data formatting is uniform.
       AND.push({
-        isFavourite: isFavourite === "true"
+        CustomerDate: {
+          gte: StartDate,
+          lte: EndDate
+        }
       });
     }
 
     // --------------------------------------------
-    // KEYWORD SEARCH
+    // 4. KEYWORD SEARCH
     // --------------------------------------------
     const keyword = Keyword?.trim();
-
     if (keyword) {
       const { tokens, fields, priceRange } = await getKeywordSearchData(keyword);
 
-      console.log(" tokens are ", tokens, "  \n fields are : ", fields)
-
-      // ✅ APPLY KEYWORD FILTER ONLY IF TOKENS EXIST
       if (tokens.length > 0) {
         AND.push({
           AND: tokens.map((t) => ({
-            OR: fields.map((field) => ({
-              [field]: { contains: t },
-            })),
+            OR: fields.map((field) => ({ [field]: { contains: t } })),
           })),
         });
       }
 
-      // ✅ APPLY PRICE RANGE FROM AI (independent)
       if (priceRange?.min || priceRange?.max) {
-        const min = priceRange?.min !== null
-          ? Number(String(priceRange.min).replace(/[^0-9]/g, ""))
-          : null;
-
-        const max = priceRange?.max !== null
-          ? Number(String(priceRange.max).replace(/[^0-9]/g, ""))
-          : null;
+        const min = priceRange?.min !== null ? cleanNumber(priceRange.min) : null;
+        const max = priceRange?.max !== null ? cleanNumber(priceRange.max) : null;
 
         if (!isNaN(min) || !isNaN(max)) {
           AND.push({
@@ -589,306 +1233,119 @@ export const getCustomer = async (req, res, next) => {
       }
     }
 
-    /*      if (keyword) {
-       const tokens = keyword.split(" ").filter(Boolean);
- 
-       // Default fields (if user does NOT select anything)
-       const defaultFields = [
-         "Description",
-         "Campaign",
-         "CustomerType",
-         "CustomerSubType",
-         "customerName",
-         "ContactNumber",
-         "City",
-         "Location",
-         "SubLocation",
-         "Price",
-         "ReferenceId",
-       ];
- 
-       // User-selected fields (comma-separated)
-       // User-selected fields (array or single string)
-       let selectedFields;
-       if (!SearchIn) {
-         selectedFields = defaultFields; // default fields if nothing selected
-       } else if (Array.isArray(SearchIn)) {
-         selectedFields = SearchIn.map(f => f.trim());
-       } else {
-         selectedFields = SearchIn.split(",").map(f => f.trim());
-       }
- 
-       AND.push({
-         AND: tokens.map((t) => ({
-           OR: selectedFields.map((field) => ({
-             [field]: { contains: t },
-           })),
-         })),
-       });
-     } */
 
+    const where = AND.length ? { AND } : {};
+    const orderBy = sort?.toLowerCase() === "asc"
+      ? [{ createdAt: "asc" }]
+      : [{ updatedAt: "desc" }, { createdAt: "desc" }];
 
+    // --------------------------------------------
+    // 🚀 OPTIMIZED FETCH (Concurrent Execution)
+    // --------------------------------------------
 
+    // We fire BOTH the count and the page fetch at the exact same time.
+    // We let Prisma natively handle skip/take instead of manual JS slicing.
+    const [totalRecords, customers] = await Promise.all([
+      // 1. Get total records
+      ContactNumber
+        ? prisma.customer.count({ where })
+        : prisma.customer.findMany({
+          where,
+          distinct: ["ContactNumber"],
+          select: { id: true },
+        }).then(res => res.length),
+
+      // 2. Fetch the actual page data natively
+      prisma.customer.findMany({
+        where,
+        orderBy,
+        skip: offset,
+        ...(Limit !== undefined && { take: REQUIRED }),
+        // Apply distinct safely
+        ...(!ContactNumber && { distinct: ["ContactNumber"] }),
+        include: {
+          // 🚀 ONLY pull the fields the UI actually renders
+          AssignTo: {
+            select: { id: true, name: true, email: true, role: true, city: true }
+          },
+          _count: { select: { shortlistedProperties: true } }
+        },
+      })
+    ]);
+
+    // --------------------------------------------
+    // FINAL TRANSFORM & RESPONSE
+    // --------------------------------------------
+    const transformed = await Promise.all(customers.map(transformGetCustomer,admin));
+    if (admin.role === "agent") {
+      transformed.forEach((customer) => {
+        if (customer.CreatedById !== (admin.id || admin._id)) {
+          customer.ContactNumber = "Forbidden"; // or "**********"
+        }
+      });
+    }
+
+    // Optional but highly recommended: Send the totalRecords back in headers or a wrapper 
+    // so the frontend doesn't have to guess the pagination.
+    res.setHeader('X-Total-Count', totalRecords);
+
+    return res.status(200).json(transformed);
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+// GET /customer/custom-field-values
+// Scans CustomerFields across records the admin can see, returns { key: [distinct values] }
+export const getCustomFieldValues = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    let AND = [];
+
+    // same role scoping as getCustomer — otherwise a client/city-scoped admin
+    // could see custom field values from data they shouldn't have access to
+    if (admin.role !== "administrator" && admin.clientId) {
+      AND.push({
+        OR: [{ ClientId: admin.clientId }, { CreatedById: admin.id || admin._id }],
+      });
+    }
+    if (admin.role === "user") {
+      const adminId = admin.id || admin._id;
+      AND.push({
+        OR: [{ AssignTo: { some: { id: adminId } } }, { CreatedById: adminId }],
+      });
+    } else if (admin.role === "city_admin") {
+      AND.push({ City: { equals: admin.city } });
+    }
 
     const where = AND.length ? { AND } : {};
 
-    let orderBy = [];
+    const rows = await prisma.customer.findMany({
+      where,
+      select: { CustomerFields: true },
+    });
 
-    if (sort?.toLowerCase() === "asc") {
-      orderBy.push({ createdAt: "asc" });
-    }
-    else {
-      orderBy.push({ updatedAt: "desc" });
-      orderBy.push({ createdAt: "desc" });
-    }
-
-    // --------------------------------------------
-    // TOTAL COUNT (FOR PAGINATION)
-    // --------------------------------------------
-    //console.log("FINAL WHERE => ", JSON.stringify(where, null, 2));
-    const totalRecords = await prisma.customer.count({ where });
-
-    // --------------------------------------------
-    // MAIN PRISMA FETCH
-    // --------------------------------------------
-
-    let customers;
-
-    if (Limit !== undefined) {
-      const REQUIRED = Number(Limit);
-
-      if (!ContactNumber) {
-        const BUFFER = REQUIRED * FETCH_MULTIPLIER;
-
-        customers = await prisma.customer.findMany({
-          where,
-          orderBy: [
-            { updatedAt: "desc" },
-            { createdAt: "desc" }
-          ],
-          distinct: ["ContactNumber"],
-          skip: offset,
-          take: BUFFER, // ✅ changed
-          include: { AssignTo: true }
-        });
-
-        // ✅ global sorting
-        customers.sort((a, b) => {
-          const aTime = new Date(a.updatedAt || a.createdAt).getTime();
-          const bTime = new Date(b.updatedAt || b.createdAt).getTime();
-          return bTime - aTime;
-        });
-
-        // ✅ FINAL LIMIT APPLY HERE ONLY
-        customers = customers.slice(offset, offset + REQUIRED);
-      } else {
-        customers = await prisma.customer.findMany({
-          where,
-          orderBy,
-          skip: Limit !== undefined ? offset : undefined,
-          take: REQUIRED,
-          include: { AssignTo: true }
-        });
-      }
-
-    } else {
-      if (!ContactNumber) {
-        // ✅ 🔥 APPLY DISTINCT HERE ALSO
-        customers = await prisma.customer.findMany({
-          where,
-          orderBy: [
-            { updatedAt: "desc" },
-            { createdAt: "desc" }
-          ],
-          distinct: ["ContactNumber"],
-          skip: offset,
-          include: { AssignTo: true }
-        });
-
-        // ✅ IMPORTANT: re-sort globally
-        customers.sort((a, b) => {
-          const aTime = new Date(a.updatedAt || a.createdAt).getTime();
-          const bTime = new Date(b.updatedAt || b.createdAt).getTime();
-          return bTime - aTime;
-        });
-
-      } else {
-        // ✅ normal flow
-        customers = await prisma.customer.findMany({
-          where,
-          orderBy,
-          skip: offset,
-          include: { AssignTo: true }
-        });
-      }
-    }
-
-
-    // --------------------------------------------
-    // POST-FETCH FILTER + SORT BY CustomerDate
-    // ONLY IF BOTH START AND END PROVIDED
-    // --------------------------------------------
-    if (StartDate && EndDate) {
-
-      const parseDMY = (str) => {
-        if (!str) return null;
-
-        const parts = str.split("-");
-        if (parts.length !== 3) return null;
-
-        let day, month, year;
-
-        // yyyy-mm-dd
-        if (parts[0].length === 4) {
-          [year, month, day] = parts.map(Number);
-        }
-        // dd-mm-yyyy
-        else {
-          [day, month, year] = parts.map(Number);
-        }
-
-        const d = new Date(year, month - 1, day);
-        d.setHours(0, 0, 0, 0); // 🔥 normalize time
-
-        return isNaN(d.getTime()) ? null : d;
-      };
-
-      const start = parseDMY(StartDate);
-      const end = parseDMY(EndDate);
-
-      if (start && end) {
-
-        end.setHours(23, 59, 59, 999); // include full end day
-
-        // 1️⃣ FILTER FIRST
-        customers = customers.filter((c) => {
-          const d = parseDMY(c.CustomerDate);
-          return d && d >= start && d <= end;
-        });
-
-        // 2️⃣ DEDUPLICATE BEFORE SORT (important)
-        /*  if (!ContactNumber) {
-           customers = deduplicateByContact(customers);
-         } */
-
-        // 3️⃣ STRICT ASC SORT (24 → 25 → 26 → 27 → 28)
-        customers.sort((a, b) => {
-          const aTime = parseDMY(a.CustomerDate)?.getTime() || 0;
-          const bTime = parseDMY(b.CustomerDate)?.getTime() || 0;
-          return bTime - aTime;
-        });
-      }
-    }
-
-
-
-
-
-    // --------------------------------------------
-    // FILTER BY USER (name / email / role / city)
-    // --------------------------------------------
-    if (User) {
-      const userLower = User.toLowerCase();
-
-      const admins = await prisma.admin.findMany({
-        where: {
-          OR: [
-            { name: { contains: User } },
-            { email: { contains: User } },
-            { city: { contains: User } },
-
-            // ENUM ROLE MATCH (no contains allowed)
-            ["admin", "city_admin", "user"].includes(userLower)
-              ? { role: { equals: User } }
-              : undefined,
-          ].filter(Boolean),
-        },
-        select: { id: true },
+    const valueMap = {};
+    rows.forEach((row) => {
+      const cf = row.CustomerFields;
+      if (!cf || typeof cf !== "object") return;
+      Object.entries(cf).forEach(([key, value]) => {
+        const trimmed = String(value ?? "").trim();
+        if (!trimmed) return;
+        if (!valueMap[key]) valueMap[key] = new Set();
+        valueMap[key].add(trimmed);
       });
+    });
 
-      const allowedIds = admins.map((a) => a.id);
+    const result = Object.fromEntries(
+      Object.entries(valueMap).map(([key, set]) => [
+        key,
+        Array.from(set).sort((a, b) => a.localeCompare(b)).slice(0, 200), // cap payload size
+      ])
+    );
 
-      const filtered = customers.filter(
-        (c) => c.AssignTo?.some(a => allowedIds.includes(a.id))
-      );
-      customers.sort((a, b) => {
-        const aTime = new Date(a.updatedAt || a.createdAt).getTime();
-        const bTime = new Date(b.updatedAt || b.createdAt).getTime();
-        return bTime - aTime;
-      });
-      const transformed = await Promise.all(filtered.map(transformGetCustomer));
-
-      return res.status(200).json(transformed);
-    }
-
-    // --------------------------------------------
-    // PRIORITY-BASED MATCHING & RANKING (AI-LIKE)
-    // --------------------------------------------
-    /* if (keyword) {
-      const tokens = keyword.split(" ").filter(Boolean);
-
-      customers = customers.map((c) => {
-        let score = 0;
-
-        const desc = c.Description?.toLowerCase() || "";
-        const campaign = c.Campaign?.toLowerCase() || "";
-        const type = c.CustomerType?.toLowerCase() || "";
-        const subtype = c.CustomerSubType?.toLowerCase() || "";
-        const city = c.City?.toLowerCase() || "";
-        const location = c.Location?.toLowerCase() || "";
-        const sublocation = c.SubLocation?.toLowerCase() || "";
-        const price = c.Price?.toString() || "";
-        const ref = c.ReferenceId?.toLowerCase() || "";
-
-        // 🔥 STRICT PRIORITY ORDER
-        if (desc.includes(keyword)) score += 100;
-        if (campaign.includes(keyword)) score += 90;
-        if (type.includes(keyword)) score += 80;
-        if (subtype.includes(keyword)) score += 70;
-        if (city.includes(keyword)) score += 60;
-        if (location.includes(keyword)) score += 50;
-        if (sublocation.includes(keyword)) score += 40;
-        if (price.includes(keyword)) score += 30;
-        if (ref.includes(keyword)) score += 20;
-
-        // 🔹 Multi-word partial matching (AI feel)
-        tokens.forEach((t) => {
-          if (desc.includes(t)) score += 10;
-          if (campaign.includes(t)) score += 9;
-          if (type.includes(t)) score += 8;
-          if (subtype.includes(t)) score += 7;
-          if (city.includes(t)) score += 6;
-          if (location.includes(t)) score += 5;
-          if (sublocation.includes(t)) score += 4;
-          if (price.includes(t)) score += 3;
-          if (ref.includes(t)) score += 2;
-        });
-
-        return { ...c, _score: score };
-      });
-
-      // Highest relevance first
-      customers.sort((a, b) => b._score - a._score);
-    } */
-
-
-    // --------------------------------------------
-    // DEDUPLICATE BY CONTACTNUMBER ONLY IF NOT FILTERED BY ContactNumber
-    // --------------------------------------------
-    /*  if (!ContactNumber) {
-       customers = deduplicateByContact(customers);
-     } */
-
-    /*     if (Limit !== undefined) {
-          customers = customers.slice(0, Number(Limit));
-        } */
-
-    // --------------------------------------------
-    // FINAL TRANSFORM
-    // --------------------------------------------
-    const transformed = await Promise.all(customers.map(transformGetCustomer));
-
-    res.status(200).json(transformed);
+    return res.status(200).json(result);
   } catch (error) {
     next(new ApiError(500, error.message));
   }
@@ -913,7 +1370,7 @@ export const getCustomerById = async (req, res, next) => {
     if (admin.role === "city_admin" && customer.City !== admin.city)
       return next(new ApiError(403, "Access denied"));
 
-    const response = await transformCustomer(customer);
+    const response = await transformCustomer(customer,admin);
     res.status(200).json(response);
   } catch (error) {
     next(new ApiError(500, error.message));
@@ -1102,19 +1559,21 @@ export const createCustomer = async (req, res, next) => {
         });
         console.log(" automation res is ", automationRes) */
 
-            // 🔥 UNIVERSAL EVENT TRIGGER
-/*     await notifyCustomerCreated({
-      customer: newCustomer,
-      admin,
-    }); */
+    // 🔥 UNIVERSAL EVENT TRIGGER
+    /*     await notifyCustomerCreated({
+          customer: newCustomer,
+          admin,
+        }); */
 
     res
       .status(201)
-      .json({ success: true, data: await transformCustomer(newCustomer) });
+      .json({ success: true, data: await transformCustomer(newCustomer,admin) });
   } catch (error) {
     next(new ApiError(500, error.message));
   }
 };
+
+
 
 
 export const updateCustomer = async (req, res, next) => {
@@ -1388,12 +1847,13 @@ export const updateCustomer = async (req, res, next) => {
     const updated = await prisma.customer.update({
       where: { id },
       data: updateData,
+      include: { AssignTo: true, _count: { select: { shortlistedProperties: true } } },
     });
 
     res.status(200).json({
       success: true,
       message: "Customer updated successfully",
-      data: await transformGetCustomer(updated),
+      data: await transformGetCustomer(updated,admin),
     });
   } catch (error) {
     next(new ApiError(500, error.message));
@@ -1454,42 +1914,41 @@ export const deleteCustomer = async (req, res, next) => {
 };
 
 // ASSIGN CUSTOMERS
-// ASSIGN CUSTOMERS (ID or Campaign Based)
 export const assignCustomer = async (req, res, next) => {
   try {
-    const { customerIds = [], assignToId, campaign } = req.body;
+    // ✅ NEW: action field — "assign" (default) or "remove"
+    const { customerIds = [], assignToId, campaign, action = "assign" } = req.body;
     const admin = req.admin;
+
+    // ✅ NEW: validate action value
+    if (!["assign", "remove"].includes(action)) {
+      return next(new ApiError(400, 'action must be "assign" or "remove"'));
+    }
 
     if (!assignToId || !Array.isArray(assignToId) || assignToId.length === 0)
       return next(new ApiError(400, "assignToId is required"));
 
     // get admins
     const assignToAdmin = await prisma.admin.findMany({
-      where: {
-        id: { in: assignToId },
-      },
-      select: {
-        id: true,
-        role: true,
-        clientId: true,
-        city: true,
-      },
+      where: { id: { in: assignToId } },
+      select: { id: true, role: true, clientId: true, city: true },
     });
 
     if (!assignToAdmin || assignToAdmin.length === 0)
       return next(new ApiError(404, "Admin/User not found"));
 
     // ------------------------------------------------
-    //  RESTRICTION: USER can only get selected IDs
+    // RESTRICTION: USER can only use selected IDs
+    // (applies to both assign AND remove)
     // ------------------------------------------------
-    const hasUser = assignToAdmin.some((a) => a.role === "user");
+    const hasUser = assignToAdmin.some((a) => a.role === "user" || a.role === "agent");
 
     if (hasUser) {
       if (!customerIds.length || campaign) {
         return next(
           new ApiError(
             403,
-            "You can only assign selected customers to a user"
+            "You can only assign/remove selected customers for a user"
           )
         );
       }
@@ -1505,13 +1964,9 @@ export const assignCustomer = async (req, res, next) => {
       const invalidAdmin = assignToAdmin.find(
         (a) => a.clientId !== admin.clientId
       );
-
       if (invalidAdmin) {
         return next(
-          new ApiError(
-            403,
-            "You cannot assign customers to another company admin"
-          )
+          new ApiError(403, "You cannot assign customers to another company admin")
         );
       }
     }
@@ -1538,9 +1993,7 @@ export const assignCustomer = async (req, res, next) => {
 
     const customers = await prisma.customer.findMany({
       where: whereCondition,
-      include: {
-        AssignTo: true,
-      },
+      include: { AssignTo: true },
     });
 
     if (customers.length === 0)
@@ -1551,55 +2004,52 @@ export const assignCustomer = async (req, res, next) => {
     // ------------------------------------------------
     if (admin.role === "city_admin") {
       const invalid = customers.filter((c) => c.City !== admin.city);
-
       if (invalid.length > 0)
         return next(
           new ApiError(403, "You can only assign customers in your city")
         );
 
       const invalidAssign = assignToAdmin.find((a) => a.city !== admin.city);
-
       if (invalidAssign)
         return next(
           new ApiError(403, "You can only assign to users in your city")
         );
-    } else if (admin.role === "user") {
+    } else if (admin.role === "user" || admin.role === "agent") {
       return next(
         new ApiError(403, "Users are not allowed to assign customers")
       );
     }
 
     // ------------------------------------------------
-    // UPDATE
+    // UPDATE — ✅ connect OR disconnect based on action
     // ------------------------------------------------
-    const updates = [];
+    const prismaRelationAction = action === "remove" ? "disconnect" : "connect";
 
-    for (const customer of customers) {
-      updates.push(
-        prisma.customer.update({
-          where: { id: customer.id },
-          data: {
-            AssignTo: {
-              connect: assignToId.map((id) => ({ id })),
-            }
+    const updates = customers.map((customer) =>
+      prisma.customer.update({
+        where: { id: customer.id },
+        data: {
+          AssignTo: {
+            [prismaRelationAction]: assignToId.map((id) => ({ id })),
           },
-        })
-      );
-    }
+        },
+      })
+    );
 
     await Promise.all(updates);
 
     const updated = await prisma.customer.findMany({
       where: whereCondition,
-      include: {
-        AssignTo: true,
-      },
+      include: { AssignTo: true },
     });
+
+    // ✅ Dynamic message reflects the action taken
+    const actionLabel = action === "remove" ? "Unassigned" : "Assigned";
 
     res.status(200).json({
       success: true,
-      message: `Assigned ${updated.length} customers successfully`,
-      data: await Promise.all(updated.map(transformGetCustomer)),
+      message: `${actionLabel} ${updated.length} customers successfully`,
+      data: await Promise.all(updated.map(transformGetCustomer,admin)),
     });
   } catch (error) {
     next(new ApiError(500, error.message));
@@ -1658,7 +2108,7 @@ export const getFavouriteCustomers = async (req, res, next) => {
       where,
       orderBy: { createdAt: "desc" },
     });
-    const transformed = await Promise.all(favs.map(transformGetCustomer));
+    const transformed = await Promise.all(favs.map(transformGetCustomer,admin));
     res
       .status(200)
       .json({ success: true, count: transformed.length, data: transformed });
@@ -1764,8 +2214,11 @@ export const deleteAllCustomers = async (req, res, next) => {
 };
 
 
+
+
+
 // ------------------------------------------------------
-//               RECOMMEND CUSTOMER (AI-AGENT)
+//                RECOMMEND CUSTOMER (AI-AGENT)
 // ------------------------------------------------------
 
 export const getRecommendedCustomer = async (req, res, next) => {
@@ -1781,10 +2234,6 @@ export const getRecommendedCustomer = async (req, res, next) => {
       return next(new ApiError(400, "customerId is required"));
     }
 
-    // --------------------------------------------
-    // 🔥 GET BASE CUSTOMER (LIKE QUALIFY FLOW)
-    // --------------------------------------------
-
     const baseCustomer = await prisma.customer.findUnique({
       where: { id: customerId },
     });
@@ -1799,10 +2248,10 @@ export const getRecommendedCustomer = async (req, res, next) => {
     });
 
     // --------------------------------------------
-    // 🔥 AI FILTER GENERATION (MAIN CHANGE)
+    // 🔥 AI FILTER GENERATION
     // --------------------------------------------
 
-    const { tokens, fields, priceRange, answer } =
+    const { tokens, fields, priceRange, answer, nearbyLocations } =
       await getRecommendedKeywordSearchData(
         userPrompt,
         baseCustomer,
@@ -1812,7 +2261,7 @@ export const getRecommendedCustomer = async (req, res, next) => {
     let AND = [];
 
     // --------------------------------------------
-    // ROLE-BASED FILTERS (UNCHANGED)
+    // ROLE-BASED FILTERS
     // --------------------------------------------
 
     if (admin.role !== "administrator" && admin.clientId) {
@@ -1826,17 +2275,10 @@ export const getRecommendedCustomer = async (req, res, next) => {
 
     if (admin.role === "user") {
       const adminId = admin.id || admin._id;
-
       AND.push({
         OR: [
-          {
-            AssignTo: {
-              some: { id: adminId }
-            }
-          },
-          {
-            CreatedById: adminId
-          }
+          { AssignTo: { some: { id: adminId } } },
+          { CreatedById: adminId }
         ]
       });
     }
@@ -1845,11 +2287,7 @@ export const getRecommendedCustomer = async (req, res, next) => {
       const adminId = admin.id || admin._id;
 
       const assignedCampaignsData = await prisma.customer.findMany({
-        where: {
-          AssignTo: {
-            some: { id: adminId }
-          }
-        },
+        where: { AssignTo: { some: { id: adminId } } },
         select: { Campaign: true },
         distinct: ["Campaign"]
       });
@@ -1879,19 +2317,58 @@ export const getRecommendedCustomer = async (req, res, next) => {
       });
     }
 
-    // --------------------------------------------
-    // 🔥 APPLY AI FILTERS (SMART)
-    // --------------------------------------------
+    // 1. Exclude the exact base customer record
+    AND.push({
+      id: { not: baseCustomer.id }
+    });
 
-    if (tokens.length > 0) {
+    // 2. Exclude any other records sharing the exact same contact number
+    if (baseCustomer.ContactNumber) {
       AND.push({
-        AND: tokens.map((t) => ({
-          OR: fields.map((field) => ({
-            [field]: { contains: t },
-          })),
-        })),
+        ContactNumber: { not: baseCustomer.ContactNumber }
       });
     }
+
+    // --------------------------------------------
+    // EXCLUDE "OTHER" LOCATIONS
+    // --------------------------------------------
+    // Exclude location variations of "other/others" while keeping records where Location is null/empty
+    AND.push({
+      OR: [
+        { Location: null },
+        { Location: { notIn: ["other", "Other", "OTHER", "others", "Others", "OTHERS", "N/A", "n/a"] } }
+      ]
+    });
+
+    // --------------------------------------------
+    // 🔥 1. HARD FILTER: CAMPAIGN ONLY
+    // --------------------------------------------
+
+    // If Seller -> Get ALL Buyers. If Buyer -> Get ALL Sellers.
+    if (baseCustomer.Campaign) {
+      const currentCampaign = baseCustomer.Campaign.toLowerCase().trim();
+      let targetCampaign = null;
+
+      if (currentCampaign === "seller") {
+        targetCampaign = "Buyer";
+      } else if (currentCampaign === "buyer") {
+        targetCampaign = "Seller";
+      } else if (currentCampaign === "rent in") {
+        targetCampaign = "Rent Out";
+      } else if (currentCampaign === "rent out") {
+        targetCampaign = "Rent In";
+      }
+
+      if (targetCampaign) {
+        AND.push({
+          Campaign: { contains: targetCampaign }
+        });
+      }
+    }
+
+    // --------------------------------------------
+    // 🔥 2. HARD FILTER: PRICE (Optional)
+    // --------------------------------------------
 
     if (priceRange?.min || priceRange?.max) {
       const min = priceRange?.min !== null
@@ -1913,37 +2390,162 @@ export const getRecommendedCustomer = async (req, res, next) => {
     }
 
     const where = AND.length ? { AND } : {};
+    
 
     // --------------------------------------------
-    // FETCH MATCHING CUSTOMERS
+    // 🔥 FETCH ALL RELEVANT CUSTOMERS
     // --------------------------------------------
+    // I REMOVED the token `WHERE` queries entirely so it fetches ALL your 250+ buyers
+    // I REMOVED `distinct: ["ContactNumber"]` so it doesn't hide dummy/duplicate records
 
     let customers = await prisma.customer.findMany({
       where,
-      orderBy: [
-        { updatedAt: "desc" },
-        { createdAt: "desc" }
-      ],
-      distinct: ["ContactNumber"],
       include: { AssignTo: true }
     });
 
     // --------------------------------------------
-    // SORT
+    // 🔥 3. STRICT GEO & TYPE RANKING
     // --------------------------------------------
 
+    const GEO_JUNK = new Set(["", "n/a", "na", "other", "others", "none", "null", "-", "unknown"]);
+    const norm = (v) => String(v || "").toLowerCase().trim().replace(/\s+/g, " ");
+
+    const safeString = (val) => {
+      const n = norm(val);
+      return GEO_JUNK.has(n) ? "" : n;
+    };
+
+    const baseCity = safeString(baseCustomer.City);
+
+    /**
+     * ⭐ THE CORE FIX.
+     * Imported rows routinely repeat the city into Location/SubLocation
+     * ("City: Jaipur, Location: Jaipur"). That is NOT a locality — treating it as
+     * one made every Jaipur record look like an exact-location match and buried
+     * the real Mansarovar↔Mansarovar hits. Anything that resolves to the city
+     * name is demoted to "no locality specified".
+     */
+    const cityForms = new Set(
+      baseCity ? [baseCity, `${baseCity} city`, `${baseCity} district`, `${baseCity} dist`, `${baseCity} rural`, `${baseCity} urban`] : []
+    );
+    const localityOf = (val, cityOfRow) => {
+      const s = safeString(val);
+      if (!s) return "";
+      if (cityForms.has(s)) return "";
+      if (cityOfRow && s === cityOfRow) return "";   // row's own Location == its own City
+      return s;
+    };
+
+    const baseLoc = localityOf(baseCustomer.Location, baseCity);
+    const baseSubLoc = localityOf(baseCustomer.SubLocation, baseCity);
+    const baseType = safeString(baseCustomer.CustomerType);
+    const baseSubType = safeString(baseCustomer.CustomerSubType);
+
+    /** Substring match, but only between two REAL localities (handles "Mansarovar Extension"). */
+    const geoHit = (a, b) => !!a && !!b && (a === b || a.includes(b) || b.includes(a));
+
+    /** Property families. A flat buyer should never be shown a commercial shop. */
+    const familyOf = (type, sub) => {
+      const s = `${safeString(type)} ${safeString(sub)}`;
+      if (/\b(plot|land|farm|agricultur|khasra|bigha)\b/.test(s)) return "land";
+      if (/\b(shop|office|commercial|showroom|warehouse|godown|industrial|hotel|restaurant)\b/.test(s)) return "commercial";
+      if (/\b(flat|apartment|house|villa|bhk|residential|kothi|duplex|pg|room|floor)\b/.test(s)) return "residential";
+      return "other";
+    };
+    const baseFamily = familyOf(baseCustomer.CustomerType, baseCustomer.CustomerSubType);
+
+    // Tokens are for SOFT scoring only — never for geo rank. Letting "jaipur"
+    // count as a location match is what made every record look exact.
+    const safeTokens = (tokens || [])
+      .map((t) => norm(t))
+      .filter((t) => t.length > 2 && !cityForms.has(t));
+
+    const safeNearbyLocations = (nearbyLocations || [])
+      .map(norm)
+      .filter((n) => n && !GEO_JUNK.has(n) && !cityForms.has(n) && n !== baseLoc && n !== baseSubLoc);
+
+    customers = customers.map((customer) => {
+      const custCity = safeString(customer.City);
+      const custLoc = localityOf(customer.Location, custCity);
+      const custSubLoc = localityOf(customer.SubLocation, custCity);
+
+      const cityMatches = geoHit(custCity, baseCity);
+
+      // ── GEO RANK: strict, base-customer only, no tokens ──
+      let geoRank = 0;
+      let geoLabel = "no-geo-match";
+
+      const subHit = geoHit(custSubLoc, baseSubLoc) || geoHit(custSubLoc, baseLoc) || geoHit(custLoc, baseSubLoc);
+      const locHit = geoHit(custLoc, baseLoc);
+      const nearHit = safeNearbyLocations.some((n) => geoHit(custLoc, n) || geoHit(custSubLoc, n));
+
+      if (cityMatches && subHit && locHit) { geoRank = 5; geoLabel = "exact-sublocation"; }
+      else if (cityMatches && subHit) { geoRank = 4.5; geoLabel = "sublocation"; }
+      else if (cityMatches && locHit) { geoRank = 4; geoLabel = "exact-location"; }
+      else if (cityMatches && nearHit) { geoRank = 3; geoLabel = "nearby-location"; }
+      else if (cityMatches) { geoRank = 2; geoLabel = "same-city-only"; }
+      else if (subHit || locHit) { geoRank = 1; geoLabel = "location-no-city"; }
+      else if (nearHit) { geoRank = 0.5; geoLabel = "nearby-no-city"; }
+
+      // ── TYPE RANK ──
+      const custType = safeString(customer.CustomerType);
+      const custSubType = safeString(customer.CustomerSubType);
+      const custFamily = familyOf(customer.CustomerType, customer.CustomerSubType);
+
+      const typeMatches = geoHit(custType, baseType);
+      const subTypeMatches = geoHit(custSubType, baseSubType);
+
+      let typeRank = 0;
+      if (typeMatches && subTypeMatches) typeRank = 3;
+      else if (typeMatches) typeRank = 2;
+      else if (subTypeMatches) typeRank = 1;
+
+      // A flat buyer matched to a commercial shop is worse than a flat buyer in
+      // the wrong locality — family outranks geography.
+      const familyRank =
+        baseFamily === "other" || custFamily === "other" ? 1 :
+        custFamily === baseFamily ? 2 : 0;
+
+      // ── SOFT SCORE: tokens live here, and only here ──
+      let score = 0;
+      if (safeTokens.length > 0) {
+        const validFields = ["Description", "CustomerType", "CustomerSubType", "LeadType", "SubLocation", "Adderess", "Facillities"];
+        safeTokens.forEach((t) => {
+          if (validFields.some((f) => customer[f] && norm(customer[f]).includes(t))) score += 1;
+        });
+      }
+
+      return { ...customer, _geoRank: geoRank, _geoLabel: geoLabel, _typeRank: typeRank, _familyRank: familyRank, _matchScore: score };
+    });
+
+    // Drop hard family mismatches entirely (set STRICT_FAMILY=false to only demote them).
+    const STRICT_FAMILY = process.env.RECO_STRICT_FAMILY !== "false";
+    if (STRICT_FAMILY && baseFamily !== "other") {
+      customers = customers.filter((c) => c._familyRank > 0);
+    }
+
+    // Optional: hide pure "same city, nothing else" noise once you have real matches.
+    const MIN_GEO = Number(process.env.RECO_MIN_GEO_RANK || 0);
+    if (MIN_GEO > 0) {
+      const strong = customers.filter((c) => c._geoRank >= MIN_GEO);
+      if (strong.length >= 10) customers = strong;
+    }
+
+    // --- MULTI-LEVEL SORT ---
     customers.sort((a, b) => {
-      const aTime = new Date(a.updatedAt || a.createdAt).getTime();
-      const bTime = new Date(b.updatedAt || b.createdAt).getTime();
-      return bTime - aTime;
+      if (b._familyRank !== a._familyRank) return b._familyRank - a._familyRank;
+      if (b._geoRank !== a._geoRank) return b._geoRank - a._geoRank;
+      if (b._typeRank !== a._typeRank) return b._typeRank - a._typeRank;
+      if (b._matchScore !== a._matchScore) return b._matchScore - a._matchScore;
+      return new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime();
     });
 
     // --------------------------------------------
-    // TRANSFORM
+    // TRANSFORM & RESPONSE
     // --------------------------------------------
 
     const transformed = await Promise.all(
-      customers.map(transformGetCustomer)
+      customers.map(transformGetCustomer,admin)
     );
 
     res.status(200).json({
@@ -1951,9 +2553,11 @@ export const getRecommendedCustomer = async (req, res, next) => {
       count: transformed.length,
       data: transformed,
       aiAnswer: answer,
-      appliedFilters: {
-        tokens,
-        fields,
+     appliedFilters: {
+        tokens: safeTokens,
+        nearbyLocations: safeNearbyLocations,
+        baseFamily,
+        baseGeo: { city: baseCity, location: baseLoc || "(city-only)", sublocation: baseSubLoc || "(none)" },
         priceRange
       }
     });
@@ -2212,7 +2816,7 @@ export const dataMining = async (req, res, next) => {
   }
 };
 
-export const startCall = async (req, res) => {
+export const startCall = async (req, res, next) => {
   try {
     const { userPrompt, customerId } = req.body;
 
@@ -2302,7 +2906,6 @@ export const startCall = async (req, res) => {
   }
 };
 
-
 export const getCallLogs = async (req, res) => {
   try {
     const response = await fetch(
@@ -2339,9 +2942,6 @@ export const getCallLogs = async (req, res) => {
     });
   }
 };
-
-
-
 
 export const getCallReport = async (req, res, next) => {
   try {
@@ -2398,7 +2998,6 @@ export const deleteCallLogById = async (req, res) => {
     return res.status(500).json({ message: "Internal server error" });
   }
 };
-
 
 export const syncCallLogs = async (req, res) => {
   try {
@@ -2490,5 +3089,621 @@ export const syncCallLogs = async (req, res) => {
     return res.status(500).json({
       message: "Sync failed",
     });
+  }
+};
+
+//deal closing controllers 
+
+// ─── Close a Deal ─────────────────────────────────────────────────────────────
+export const closeDeal = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    const { id } = req.params;
+
+    // check customer exists
+    const customer = await prisma.customer.findUnique({ where: { id } });
+    if (!customer) return res.status(404).json({ success: false, message: "Customer not found" });
+
+    // role-based access — only allow if admin created it, assigned to it, or is administrator
+    const adminId = admin.id || admin._id;
+    const isAdministrator = admin.role === "administrator";
+    const isCreator = customer.CreatedById === adminId;
+    const isAssigned = await prisma.customer.findFirst({
+      where: {
+        id,
+        AssignTo: { some: { id: adminId } }
+      }
+    });
+
+    if (!isAdministrator && !isCreator && !isAssigned) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+
+    const updated = await prisma.customer.update({
+      where: { id },
+      data: {
+        DealClosed: true,
+        updatedAt: new Date(),
+      },
+    });
+
+    return res.status(200).json({ success: true, data: updated });
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+// ─── Reopen a Deal (undo close) ───────────────────────────────────────────────
+export const reopenDeal = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    const { id } = req.params;
+
+    const customer = await prisma.customer.findUnique({ where: { id } });
+    if (!customer) return res.status(404).json({ success: false, message: "Customer not found" });
+
+    // only administrator can reopen
+    if (admin.role !== "administrator") {
+      return res.status(403).json({ success: false, message: "Only administrators can reopen deals" });
+    }
+
+    const updated = await prisma.customer.update({
+      where: { id },
+      data: {
+        DealClosed: false,
+        updatedAt: new Date(),
+      },
+    });
+
+    return res.status(200).json({ success: true, data: updated });
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+// ─── Get Closed Deals ─────────────────────────────────────────────────────────
+export const getClosedDeals = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+
+    const {
+      Campaign, City, Location, Keyword,
+      StartDate, EndDate,
+      Limit, Skip = 0,
+    } = req.query;
+
+    const offset = Number(Skip);
+    let AND = [{ DealClosed: true }]; // ← only closed deals
+
+    // ── Role-based access (same logic as getCustomer) ──────────────────────
+    if (admin.role !== "administrator" && admin.clientId) {
+      AND.push({
+        OR: [
+          { ClientId: admin.clientId },
+          { CreatedById: admin.id || admin._id }
+        ]
+      });
+    }
+
+    if (admin.role === "user") {
+      const adminId = admin.id || admin._id;
+      AND.push({
+        OR: [
+          { AssignTo: { some: { id: adminId } } },
+          { CreatedById: adminId }
+        ]
+      });
+    }
+
+    if (admin.role === "city_admin") {
+      AND.push({ City: { equals: admin.city } });
+    }
+
+    // ── Basic filters ──────────────────────────────────────────────────────
+    if (Campaign) AND.push({ Campaign: { contains: Campaign.trim() } });
+    if (City) AND.push({ City: { contains: City.trim() } });
+    if (Location) AND.push({ Location: { contains: Location.trim() } });
+
+    // ── Keyword search ─────────────────────────────────────────────────────
+    if (Keyword) {
+      const tokens = Keyword.trim().split(" ").filter(Boolean);
+      const fields = ["customerName", "ContactNumber", "City", "Location", "Campaign", "Description"];
+
+      AND.push({
+        AND: tokens.map((t) => ({
+          OR: fields.map((field) => ({ [field]: { contains: t } })),
+        })),
+      });
+    }
+
+    const where = { AND };
+
+    // ── Total count ────────────────────────────────────────────────────────
+    const total = await prisma.customer.count({ where });
+
+    // ── Fetch ──────────────────────────────────────────────────────────────
+    let customers = await prisma.customer.findMany({
+      where,
+      orderBy: [
+        { updatedAt: "desc" },
+        { createdAt: "desc" },
+      ],
+      skip: offset,
+      take: Limit !== undefined ? Number(Limit) : undefined,
+      include: { AssignTo: true },
+    });
+
+    // ── Date range filter (same pattern as getCustomer) ────────────────────
+    if (StartDate && EndDate) {
+      const parseDMY = (str) => {
+        if (!str) return null;
+        const parts = str.split("-");
+        if (parts.length !== 3) return null;
+        let day, month, year;
+        if (parts[0].length === 4) [year, month, day] = parts.map(Number);
+        else[day, month, year] = parts.map(Number);
+        const d = new Date(year, month - 1, day);
+        d.setHours(0, 0, 0, 0);
+        return isNaN(d.getTime()) ? null : d;
+      };
+
+      const start = parseDMY(StartDate);
+      const end = parseDMY(EndDate);
+
+      if (start && end) {
+        end.setHours(23, 59, 59, 999);
+        customers = customers.filter((c) => {
+          const d = parseDMY(c.CustomerDate);
+          return d && d >= start && d <= end;
+        });
+      }
+    }
+
+    // ── Transform ──────────────────────────────────────────────────────────
+    const transformed = await Promise.all(customers.map(transformGetCustomer,admin));
+
+    return res.status(200).json({
+      success: true,
+      total,
+      count: transformed.length,
+      data: transformed,
+    });
+
+  } catch (error) {
+    console.log(" what/s this ", error)
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+//saved properties shortlist for individual customer
+
+// Helper to generate Role-Based Access Control filters
+const getRbacFilters = async (admin, prisma) => {
+  let AND = [];
+  const adminId = admin.id || admin._id;
+
+  if (admin.role !== "administrator" && admin.clientId) {
+    AND.push({
+      OR: [
+        { ClientId: admin.clientId },
+        { CreatedById: adminId }
+      ]
+    });
+  }
+
+  if (admin.role === "user") {
+    AND.push({
+      OR: [
+        { AssignTo: { some: { id: adminId } } },
+        { CreatedById: adminId }
+      ]
+    });
+  } else if (admin.role === "city_admin") {
+    const assignedCampaignsData = await prisma.customer.findMany({
+      where: { AssignTo: { some: { id: adminId } } },
+      select: { Campaign: true },
+      distinct: ["Campaign"]
+    });
+
+    const assignedCampaigns = assignedCampaignsData.map(c => c.Campaign).filter(Boolean);
+
+    AND.push({
+      OR: [
+        { CreatedById: adminId },
+        {
+          AND: [
+            { AssignTo: { some: { id: adminId } } },
+            { City: { contains: admin.city } }
+          ]
+        },
+        ...(assignedCampaigns.length > 0 ? [{
+          AND: [
+            { Campaign: { in: assignedCampaigns } },
+            { City: { contains: admin.city } }
+          ]
+        }] : [])
+      ]
+    });
+  }
+
+  return AND;
+};
+
+
+// ------------------------------------------------------
+//             BULK ADD PROPERTIES TO SHORTLIST
+// ------------------------------------------------------
+export const addPropertiesToShortlist = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    const adminId = admin.id || admin._id;
+    const { customerId, propertyIds, status } = req.body;
+
+    if (!customerId || !propertyIds || !Array.isArray(propertyIds) || propertyIds.length === 0) {
+      return next(new ApiError(400, "customerId and a non-empty propertyIds array are required"));
+    }
+
+    const rbacFilters = await getRbacFilters(admin, prisma);
+
+    // 1. RBAC CHECK: Does this admin have access to the base customer?
+    const baseCustomer = await prisma.customer.findFirst({
+      where: {
+        id: customerId,
+        AND: rbacFilters.length ? rbacFilters : undefined
+      }
+    });
+
+    if (!baseCustomer) {
+      return next(new ApiError(403, "You do not have permission to modify this customer or it does not exist"));
+    }
+
+    // --------------------------------------------
+    // 🔥 PREVENT DUPLICATES LOGIC
+    // --------------------------------------------
+
+    // 2. Fetch properties from the incoming array that are ALREADY shortlisted for this customer
+    const existingShortlists = await prisma.propertyShortlist.findMany({
+      where: {
+        customerId: customerId,
+        propertyId: { in: propertyIds } // Only check the IDs we are trying to add
+      },
+      select: { propertyId: true }
+    });
+
+    // 3. Extract just the IDs of the already existing properties
+    const existingPropertyIds = existingShortlists.map(item => item.propertyId);
+
+    // 4. Filter the incoming propertyIds to ONLY include new ones
+    const newPropertyIds = propertyIds.filter(id => !existingPropertyIds.includes(id));
+
+    // 5. If everything was already shortlisted, stop early and return a success response
+    if (newPropertyIds.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "All selected properties are already in the shortlist.",
+        count: 0
+      });
+    }
+
+    // --------------------------------------------
+    // PROCEED WITH INSERTING ONLY NEW PROPERTIES
+    // --------------------------------------------
+
+    // 6. Prepare bulk insert data using the FILTERED array
+    const insertData = newPropertyIds.map(propertyId => ({
+      customerId,
+      propertyId,
+      status: status || "shortlisted",
+      savedById: adminId,
+    }));
+
+    // 7. Bulk Insert
+    const result = await prisma.propertyShortlist.createMany({
+      data: insertData,
+      skipDuplicates: true // Keeping this as an extra safety net
+    });
+
+    res.status(201).json({
+      success: true,
+      message: `Successfully saved ${result.count} new properties to the shortlist.`,
+      count: result.count,
+      alreadyExisted: existingPropertyIds.length // Optional: Let the frontend know how many were skipped
+    });
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+
+// ------------------------------------------------------
+//               GET CUSTOMER SHORTLIST
+// ------------------------------------------------------
+export const getCustomerShortlist = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    const { customerId } = req.params;
+
+    if (!customerId) {
+      return next(new ApiError(400, "customerId is required"));
+    }
+
+    const rbacFilters = await getRbacFilters(admin, prisma);
+
+    // 1. RBAC CHECK: Does this admin have access to the base customer?
+    const baseCustomer = await prisma.customer.findFirst({
+      where: {
+        id: customerId,
+        AND: rbacFilters.length ? rbacFilters : undefined
+      }
+    });
+
+    if (!baseCustomer) {
+      return next(new ApiError(403, "You do not have permission to view this customer's data"));
+    }
+
+    // 2. FETCH SHORTLIST + PROPERTIES (Applying RBAC to the included properties too)
+    const shortlists = await prisma.propertyShortlist.findMany({
+      where: {
+        customerId,
+        // Only fetch shortlisted items where the admin ALSO has access to the property itself
+        property: {
+          AND: rbacFilters.length ? rbacFilters : undefined
+        }
+      },
+      include: {
+        property: {
+          include: { AssignTo: true }
+        }
+      },
+      orderBy: { createdAt: "desc" }
+    });
+
+    // 3. TRANSFORM DATA
+    const transformedProperties = await Promise.all(
+      shortlists.map(async (item) => {
+        const transformedProperty = await transformGetCustomer(item.property,admin);
+        return {
+          ...transformedProperty,
+          _shortlistInfo: {
+            shortlistId: item.id,
+            status: item.status,
+            savedAt: item.createdAt,
+            savedById: item.savedById
+          }
+        };
+      })
+    );
+
+    res.status(200).json({
+      success: true,
+      count: transformedProperties.length,
+      data: transformedProperties
+    });
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+// ------------------------------------------------------
+//         BULK REMOVE PROPERTIES FROM SHORTLIST
+// ------------------------------------------------------
+export const removePropertiesFromShortlist = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    const { customerId, propertyIds } = req.body;
+
+    if (!customerId || !propertyIds || !Array.isArray(propertyIds)) {
+      return next(new ApiError(400, "customerId and propertyIds array are required"));
+    }
+
+    const rbacFilters = await getRbacFilters(admin, prisma);
+
+    // 1. RBAC CHECK
+    const baseCustomer = await prisma.customer.findFirst({
+      where: {
+        id: customerId,
+        AND: rbacFilters.length ? rbacFilters : undefined
+      }
+    });
+
+    if (!baseCustomer) {
+      return next(new ApiError(403, "Permission denied"));
+    }
+
+    // 2. Bulk Delete
+    const result = await prisma.propertyShortlist.deleteMany({
+      where: {
+        customerId: customerId,
+        propertyId: { in: propertyIds }
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `Removed ${result.count} properties from the shortlist.`
+    });
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+// ------------------------------------------------------
+//            UPDATE SHORTLIST STATUS
+// ------------------------------------------------------
+export const updateShortlistStatus = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    const { customerId, propertyIds, status } = req.body;
+
+    if (!customerId || !propertyIds || !Array.isArray(propertyIds) || !status) {
+      return next(new ApiError(400, "customerId, propertyIds array, and status are required"));
+    }
+
+    const rbacFilters = await getRbacFilters(admin, prisma);
+
+    // 1. RBAC CHECK
+    const baseCustomer = await prisma.customer.findFirst({
+      where: {
+        id: customerId,
+        AND: rbacFilters.length ? rbacFilters : undefined
+      }
+    });
+
+    if (!baseCustomer) {
+      return next(new ApiError(403, "Permission denied"));
+    }
+
+    // 2. Bulk Update Status
+    const result = await prisma.propertyShortlist.updateMany({
+      where: {
+        customerId: customerId,
+        propertyId: { in: propertyIds }
+      },
+      data: {
+        status: status
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `Status updated to '${status}' for ${result.count} properties.`
+    });
+
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+
+// archieve customer
+
+// ─── Archive a Customer (individual, hides only for this admin) ──────────────
+export const archiveCustomer = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    const { id } = req.params;
+    const adminId = admin.id || admin._id;
+
+    const customer = await prisma.customer.findUnique({ where: { id } });
+    if (!customer) return res.status(404).json({ success: false, message: "Customer not found" });
+
+    // upsert so a double-click / re-fire doesn't throw a unique constraint error
+    const archived = await prisma.customerArchive.upsert({
+      where: { customerId_adminId: { customerId: id, adminId } },
+      update: {},
+      create: { customerId: id, adminId },
+    });
+
+    return res.status(200).json({ success: true, data: archived });
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+// ─── Unarchive a Customer (undo, only removes the caller's own record) ───────
+export const unarchiveCustomer = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    const { id } = req.params;
+    const adminId = admin.id || admin._id;
+
+    await prisma.customerArchive.deleteMany({
+      where: { customerId: id, adminId },
+    });
+
+    return res.status(200).json({ success: true, message: "Customer unarchived" });
+  } catch (error) {
+    next(new ApiError(500, error.message));
+  }
+};
+
+// ─── Get My Archived Customers ────────────────────────────────────────────────
+export const getArchivedCustomers = async (req, res, next) => {
+  try {
+    const admin = req.admin;
+    const adminId = admin.id || admin._id;
+
+    const {
+      Campaign, City, Location, Keyword,
+      StartDate, EndDate,
+      Limit, Skip = 0,
+    } = req.query;
+
+    const offset = Number(Skip);
+    let AND = [{ archivedBy: { some: { adminId } } }]; // only this admin's archived customers
+
+    if (Campaign) AND.push({ Campaign: { contains: Campaign.trim() } });
+    if (City) AND.push({ City: { contains: City.trim() } });
+    if (Location) AND.push({ Location: { contains: Location.trim() } });
+
+    if (Keyword) {
+      const tokens = Keyword.trim().split(" ").filter(Boolean);
+      const fields = ["customerName", "ContactNumber", "City", "Location", "Campaign", "Description"];
+      AND.push({
+        AND: tokens.map((t) => ({
+          OR: fields.map((field) => ({ [field]: { contains: t } })),
+        })),
+      });
+    }
+
+    const where = { AND };
+
+    const total = await prisma.customer.count({ where });
+
+    let customers = await prisma.customer.findMany({
+      where,
+      orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
+      skip: offset,
+      take: Limit !== undefined ? Number(Limit) : undefined,
+      include: {
+        AssignTo: true,
+        archivedBy: { where: { adminId }, select: { createdAt: true } }, // so you can show "archived 2d ago"
+      },
+    });
+
+    if (StartDate && EndDate) {
+      const parseDMY = (str) => {
+        if (!str) return null;
+        const parts = str.split("-");
+        if (parts.length !== 3) return null;
+        let day, month, year;
+        if (parts[0].length === 4) [year, month, day] = parts.map(Number);
+        else[day, month, year] = parts.map(Number);
+        const d = new Date(year, month - 1, day);
+        d.setHours(0, 0, 0, 0);
+        return isNaN(d.getTime()) ? null : d;
+      };
+      const start = parseDMY(StartDate);
+      const end = parseDMY(EndDate);
+      if (start && end) {
+        end.setHours(23, 59, 59, 999);
+        customers = customers.filter((c) => {
+          const d = parseDMY(c.CustomerDate);
+          return d && d >= start && d <= end;
+        });
+      }
+    }
+
+    const transformed = await Promise.all(customers.map(transformGetCustomer));
+
+    return res.status(200).json({
+      success: true,
+      total,
+      count: transformed.length,
+      data: transformed,
+    });
+  } catch (error) {
+    next(new ApiError(500, error.message));
   }
 };
